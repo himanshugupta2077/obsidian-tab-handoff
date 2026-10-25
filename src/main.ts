@@ -58,7 +58,13 @@ export default class TabHandoffPlugin extends Plugin {
 	}
 
 	private async start() {
-		const own = await this.readState(this.ownPath());
+		const strays = await this.strayOwnFiles();
+		let own = await this.readState(this.ownPath());
+		if (!own && strays.length) {
+			// The folder changed since this device last saved: carry its state over to the new one.
+			own = await this.readState(strays[0].path);
+			this.dirty = true;
+		}
 		if (own) {
 			this.local = own;
 			this.local.device.name = this.deviceName;
@@ -95,6 +101,8 @@ export default class TabHandoffPlugin extends Plugin {
 		this.registerDomEvent(window, "blur", () => this.saveNow());
 		this.registerInterval(window.setInterval(() => void this.flush(), FLUSH_INTERVAL_MS));
 
+		await this.flush();
+		await this.trashStrays(strays);
 		await this.resume();
 	}
 
@@ -210,6 +218,29 @@ export default class TabHandoffPlugin extends Plugin {
 		// Sync delivered another device's state. Hand it off only if this device just woke up;
 		// otherwise you're working here and shouldn't be yanked around.
 		if (Date.now() - this.resumedAt < RESUME_WINDOW_MS) await this.handoff();
+	}
+
+	/**
+	 * Copies of this device's state outside the state folder: left behind when the folder was moved or
+	 * changed on another device, or brought back by Sync. Only this device writes its file, so they are stale.
+	 */
+	private async strayOwnFiles(): Promise<TFile[]> {
+		const out: TFile[] = [];
+		for (const f of this.app.vault.getMarkdownFiles()) {
+			if (f.basename !== this.deviceId || f.path === this.ownPath()) continue;
+			if ((await this.readState(f.path))?.device.id === this.deviceId) out.push(f);
+		}
+		return out;
+	}
+
+	/** Trashes stray copies, and their folder once it is empty, so an old state folder stops coming back. */
+	private async trashStrays(strays: TFile[]) {
+		const { fileManager } = this.app;
+		for (const f of strays) {
+			const parent = f.parent;
+			await fileManager.trashFile(f);
+			if (parent && !parent.isRoot() && parent.path !== this.folder() && parent.children.length === 0) await fileManager.trashFile(parent);
+		}
 	}
 
 	private async onRename(path: string, oldPath: string) {
@@ -365,7 +396,14 @@ export default class TabHandoffPlugin extends Plugin {
 
 	/** data.json changed through sync, for example the state folder was changed on another device. */
 	async onExternalSettingsChange() {
+		const before = this.folder();
 		await this.loadSettings();
+		if (this.folder() !== before) {
+			// Save this device's state in the new folder, then clear it out of the old one.
+			this.dirty = true;
+			await this.flush();
+			await this.trashStrays(await this.strayOwnFiles());
+		}
 		this.remotes.clear();
 		await this.loadRemotes();
 	}

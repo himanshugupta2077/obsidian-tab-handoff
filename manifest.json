@@ -1,7 +1,7 @@
 {
 	"id": "tab-handoff",
 	"name": "Tab Handoff",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"minAppVersion": "1.8.7",
 	"description": "Pick up where you left off on any device: your open and pinned tabs, and the exact spot you were reading in each note and PDF.",
 	"author": "Himanshu Gupta",
