@@ -1,15 +1,23 @@
 {
 	"name": "obsidian-tab-handoff",
-	"version": "1.0.0",
-	"description": "Pick up where you left off on any device: your open and pinned tabs, and the exact spot you were reading in each note.",
+	"version": "1.1.0",
+	"description": "Pick up where you left off on any device: your open and pinned tabs, and the exact spot you were reading in each note and PDF.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-		"test": "node --experimental-strip-types --test src/state.test.ts"
+		"test": "node --experimental-strip-types --test src/state.test.ts",
+		"lint": "eslint ."
 	},
-	"keywords": ["obsidian", "plugin", "tabs", "sync", "mobile", "reading position"],
+	"keywords": [
+		"obsidian",
+		"plugin",
+		"tabs",
+		"sync",
+		"mobile",
+		"reading position"
+	],
 	"license": "MIT",
 	"repository": {
 		"type": "git",
@@ -18,8 +26,11 @@
 	"devDependencies": {
 		"@types/node": "^22.0.0",
 		"esbuild": "0.25.5",
+		"eslint": "^9.39.5",
+		"eslint-plugin-obsidianmd": "^0.4.2",
 		"obsidian": "latest",
 		"tslib": "2.4.0",
-		"typescript": "^5.8.3"
+		"typescript": "^5.8.3",
+		"typescript-eslint": "^8.72.0"
 	}
 }

@@ -49,10 +49,9 @@ export function parse(text: string): DeviceState | null {
 	const end = text.indexOf("\n" + FENCE_CLOSE, start + FENCE_OPEN.length);
 	if (end < 0) return null;
 	try {
-		const s = JSON.parse(text.slice(start + FENCE_OPEN.length, end));
+		const s = JSON.parse(text.slice(start + FENCE_OPEN.length, end)) as Partial<DeviceState> | null;
 		if (s?.version !== 1 || typeof s.device?.id !== "string" || !Array.isArray(s.tabs?.list)) return null;
-		s.positions ??= {};
-		return s as DeviceState;
+		return { ...s, positions: s.positions ?? {} } as DeviceState;
 	} catch {
 		return null;
 	}
@@ -90,10 +89,16 @@ export function renamePath(state: DeviceState, oldPath: string, newPath: string)
 	let changed = false;
 	for (const t of state.tabs.list) {
 		const n = move(t.path);
-		if (n) (t.path = n), (changed = true);
+		if (n) {
+			t.path = n;
+			changed = true;
+		}
 	}
 	const active = state.tabs.active && move(state.tabs.active);
-	if (active) (state.tabs.active = active), (changed = true);
+	if (active) {
+		state.tabs.active = active;
+		changed = true;
+	}
 	for (const [p, pos] of Object.entries(state.positions)) {
 		const n = move(p);
 		if (n) {

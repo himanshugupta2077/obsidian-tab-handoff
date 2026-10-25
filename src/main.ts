@@ -1,5 +1,6 @@
-import { FuzzySuggestModal, MarkdownView, Notice, Platform, Plugin, TFile, TFolder, WorkspaceLeaf, debounce, normalizePath } from "obsidian";
+import { FuzzySuggestModal, Notice, Platform, Plugin, TFile, View, WorkspaceLeaf, debounce, normalizePath } from "obsidian";
 import { DeviceState, TabEntry, emptyState, newestPosition, newestTabs, parse, prunePositions, renamePath, serialize, tabSignature, timeAgo } from "./state";
+import { Reader, readerFor } from "./readers";
 import { DEFAULT_SETTINGS, TabHandoffSettings, TabHandoffSettingTab } from "./settings";
 
 const DEVICE_ID_KEY = "tab-handoff-device-id";
@@ -27,23 +28,23 @@ export default class TabHandoffPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
-		this.deviceId = this.app.loadLocalStorage(DEVICE_ID_KEY) ?? "";
+		this.deviceId = this.loadString(DEVICE_ID_KEY) ?? "";
 		if (!this.deviceId) {
 			this.deviceId = Math.random().toString(36).slice(2, 10);
 			this.app.saveLocalStorage(DEVICE_ID_KEY, this.deviceId);
 		}
-		this.deviceName = this.app.loadLocalStorage(DEVICE_NAME_KEY) ?? defaultDeviceName();
+		this.deviceName = this.loadString(DEVICE_NAME_KEY) ?? defaultDeviceName();
 		this.local = emptyState(this.deviceId, this.deviceName);
 
 		this.addSettingTab(new TabHandoffSettingTab(this.app, this));
 		this.addCommand({ id: "pick-up-tabs", name: "Pick up tabs from another device", callback: () => new DevicePicker(this).open() });
 		this.addCommand({
 			id: "jump-to-latest-position",
-			name: "Jump to the latest reading position of this note",
+			name: "Jump to the latest reading position of this file",
 			checkCallback: (checking) => {
-				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (!view?.file) return false;
-				if (!checking) this.catchUpPosition(view, true);
+				const reader = this.activeReader();
+				if (!reader) return false;
+				if (!checking) this.catchUpPosition(reader, true);
 				return true;
 			},
 		});
@@ -84,12 +85,15 @@ export default class TabHandoffPlugin extends Plugin {
 
 		this.registerEvent(vault.on("modify", (f) => this.onVaultFile(f.path)));
 		this.registerEvent(vault.on("create", (f) => this.onVaultFile(f.path)));
-		this.registerEvent(vault.on("rename", (f, oldPath) => renamePath(this.local, oldPath, f.path) && this.markDirty()));
+		this.registerEvent(vault.on("rename", (f, oldPath) => this.onRename(f.path, oldPath)));
 
-		this.registerDomEvent(document, "visibilitychange", () => (document.hidden ? this.saveNow() : this.resume()));
-		this.registerDomEvent(window, "focus", () => this.resume());
+		this.registerDomEvent(document, "visibilitychange", () => {
+			if (document.hidden) this.saveNow();
+			else void this.resume();
+		});
+		this.registerDomEvent(window, "focus", () => void this.resume());
 		this.registerDomEvent(window, "blur", () => this.saveNow());
-		this.registerInterval(window.setInterval(() => this.flush(), FLUSH_INTERVAL_MS));
+		this.registerInterval(window.setInterval(() => void this.flush(), FLUSH_INTERVAL_MS));
 
 		await this.resume();
 	}
@@ -132,12 +136,12 @@ export default class TabHandoffPlugin extends Plugin {
 
 	private recordPosition() {
 		if (!this.ready || !this.settings.syncPositions || Date.now() < this.ignoreScrollUntil) return;
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		const scroll = view && getScroll(view);
-		if (!view?.file || scroll == null) return;
-		const prev = this.local.positions[view.file.path];
-		if (prev && Math.abs(prev.scroll - scroll) < 0.5) return;
-		this.local.positions[view.file.path] = { scroll, ts: Date.now() };
+		const reader = this.activeReader();
+		const scroll = reader?.get();
+		if (!reader || scroll == null) return;
+		const prev = this.local.positions[reader.file.path];
+		if (prev && Math.abs(prev.scroll - scroll) < reader.epsilon / 2) return;
+		this.local.positions[reader.file.path] = { scroll, ts: Date.now() };
 		this.markDirty();
 	}
 
@@ -157,9 +161,12 @@ export default class TabHandoffPlugin extends Plugin {
 		this.local.device.name = this.deviceName;
 		this.local.positions = prunePositions(this.local.positions, this.settings.maxPositions);
 		try {
-			const folder = this.folder();
-			if (!(await this.app.vault.adapter.exists(folder))) await this.app.vault.createFolder(folder);
-			await this.app.vault.adapter.write(this.ownPath(), serialize(this.local));
+			const { vault } = this.app;
+			if (!vault.getFolderByPath(this.folder())) await vault.createFolder(this.folder());
+			const text = serialize(this.local);
+			const file = vault.getFileByPath(this.ownPath());
+			if (file) await vault.process(file, () => text);
+			else await vault.create(this.ownPath(), text);
 		} catch (e) {
 			this.dirty = true;
 			console.error("Tab Handoff: could not save device state", e);
@@ -178,16 +185,16 @@ export default class TabHandoffPlugin extends Plugin {
 
 	private async readState(path: string): Promise<DeviceState | null> {
 		try {
-			if (!(await this.app.vault.adapter.exists(path))) return null;
-			return parse(await this.app.vault.adapter.read(path));
+			const file = this.app.vault.getFileByPath(path);
+			return file ? parse(await this.app.vault.read(file)) : null;
 		} catch {
 			return null;
 		}
 	}
 
 	async loadRemotes() {
-		const folder = this.app.vault.getAbstractFileByPath(this.folder());
-		if (!(folder instanceof TFolder)) return;
+		const folder = this.app.vault.getFolderByPath(this.folder());
+		if (!folder) return;
 		for (const f of folder.children) if (f instanceof TFile) await this.loadRemote(f.path);
 	}
 
@@ -203,6 +210,15 @@ export default class TabHandoffPlugin extends Plugin {
 		// Sync delivered another device's state. Hand it off only if this device just woke up;
 		// otherwise you're working here and shouldn't be yanked around.
 		if (Date.now() - this.resumedAt < RESUME_WINDOW_MS) await this.handoff();
+	}
+
+	private async onRename(path: string, oldPath: string) {
+		// The state folder itself was moved or renamed: follow it rather than recreating it.
+		if (oldPath === this.folder()) {
+			this.settings.folder = path;
+			await this.saveSettings();
+		}
+		if (renamePath(this.local, oldPath, path)) this.markDirty();
 	}
 
 	// ── Handing off ───────────────────────────────────────────────────────
@@ -223,8 +239,8 @@ export default class TabHandoffPlugin extends Plugin {
 				return;
 			}
 		}
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (view) this.catchUpPosition(view, false);
+		const reader = this.activeReader();
+		if (reader) this.catchUpPosition(reader, false);
 	}
 
 	private askToApply(src: DeviceState) {
@@ -246,7 +262,11 @@ export default class TabHandoffPlugin extends Plugin {
 		const { workspace, vault } = this.app;
 		this.applying = true;
 		try {
-			const wanted = src.tabs.list.filter((t) => vault.getAbstractFileByPath(t.path) instanceof TFile);
+			const wanted: (TabEntry & { file: TFile })[] = [];
+			for (const t of src.tabs.list) {
+				const file = vault.getFileByPath(t.path);
+				if (file) wanted.push({ ...t, file });
+			}
 			const wantedPaths = new Set(wanted.map((t) => t.path));
 			const open = new Map<string, WorkspaceLeaf>();
 			for (const { leaf, path } of this.fileLeaves()) if (!open.has(path)) open.set(path, leaf);
@@ -255,7 +275,7 @@ export default class TabHandoffPlugin extends Plugin {
 				let leaf = open.get(t.path);
 				if (!leaf) {
 					leaf = workspace.getLeaf("tab");
-					await leaf.openFile(vault.getAbstractFileByPath(t.path) as TFile, { active: false });
+					await leaf.openFile(t.file, { active: false });
 					open.set(t.path, leaf);
 				}
 				if (!!leaf.getViewState().pinned !== t.pinned) leaf.setPinned(t.pinned);
@@ -269,7 +289,8 @@ export default class TabHandoffPlugin extends Plugin {
 			if (activeLeaf) {
 				workspace.setActiveLeaf(activeLeaf, { focus: !Platform.isMobile });
 				await activeLeaf.loadIfDeferred();
-				if (activeLeaf.view instanceof MarkdownView) this.catchUpPosition(activeLeaf.view, false);
+				const reader = readerFor(activeLeaf.view);
+				if (reader) this.catchUpPosition(reader, false);
 			}
 			if (this.settings.notify) new Notice(`Picked up ${wanted.length} tabs from ${src.device.name}`, 3000);
 		} finally {
@@ -282,38 +303,46 @@ export default class TabHandoffPlugin extends Plugin {
 		}
 	}
 
-	/** Moves the note to the newest position recorded on another device, if that's newer than this device's own. */
-	catchUpPosition(view: MarkdownView, force: boolean) {
-		if (!this.settings.syncPositions || !view.file) return;
-		const path = view.file.path;
-		const best = newestPosition([this.local, ...this.remotes.values()], path);
-		if (!best || (best.from === this.local && !force)) return;
-		const current = getScroll(view) ?? 0;
-		if (Math.abs(current - best.scroll) < 1) return;
-		this.scrollTo(view, best.scroll, best.ts);
-		if (this.settings.notify && best.from !== this.local) new Notice(`Resumed where you left off on ${best.from.device.name}`, 2500);
+	private activeReader(): Reader | null {
+		return readerFor(this.app.workspace.getActiveViewOfType(View));
 	}
 
-	/** A note was opened. If it opened at the top, put it back where it was last read on any device. */
+	/** Moves to the newest position recorded on another device, if that's newer than this device's own. */
+	catchUpPosition(reader: Reader, force: boolean) {
+		if (!this.settings.syncPositions) return;
+		const best = newestPosition([this.local, ...this.remotes.values()], reader.file.path);
+		if (!best || (best.from === this.local && !force)) return;
+		whenReady(reader, (current) => {
+			if (Math.abs(current - best.scroll) < reader.epsilon) return;
+			this.moveTo(reader, best.scroll, best.ts);
+			if (this.settings.notify && best.from !== this.local) new Notice(`Resumed where you left off on ${best.from.device.name}`, 2500);
+		});
+	}
+
+	/** A file was opened. If it opened at the top, put it back where it was last read on any device. */
 	private onFileOpen(file: TFile) {
 		if (!this.settings.restoreOnOpen || !this.settings.syncPositions || this.applying) return;
 		window.setTimeout(() => {
-			const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-			if (view?.file !== file) return;
-			// Already scrolled: a link to a heading, back/forward history, or a tab that kept its place.
-			if ((getScroll(view) ?? 0) > 1) return;
-			const best = newestPosition([this.local, ...this.remotes.values()], file.path);
-			if (best && best.scroll > 1) this.scrollTo(view, best.scroll, best.ts);
+			const reader = this.activeReader();
+			if (reader?.file !== file) return;
+			whenReady(reader, (current) => {
+				// Already moved: a link to a heading or page, back/forward history, or a tab that kept its place.
+				if (current > reader.epsilon) return;
+				const best = newestPosition([this.local, ...this.remotes.values()], file.path);
+				if (best && best.scroll > reader.epsilon) this.moveTo(reader, best.scroll, best.ts);
+			});
 		}, 60);
 	}
 
-	private scrollTo(view: MarkdownView, scroll: number, ts: number) {
-		const path = view.file?.path;
-		if (!path) return;
-		this.ignoreScrollUntil = Date.now() + 1500;
-		const apply = () => view.file?.path === path && view.setEphemeralState({ scroll });
+	private moveTo(reader: Reader, scroll: number, ts: number) {
+		const path = reader.file.path;
+		const apply = () => {
+			if (reader.view.file?.path !== path) return;
+			this.ignoreScrollUntil = Date.now() + 1500;
+			reader.set(scroll);
+		};
 		apply();
-		// Reading view renders lazily; apply again once it has laid out.
+		// Views lay out lazily (reading view, PDF pages); apply again once they have.
 		window.setTimeout(apply, 150);
 		window.setTimeout(apply, 500);
 		// Same reasoning as tabs: keep the source timestamp so the position doesn't ping-pong.
@@ -329,8 +358,20 @@ export default class TabHandoffPlugin extends Plugin {
 		this.markDirty();
 	}
 
+	private loadString(key: string): string | null {
+		const v: unknown = this.app.loadLocalStorage(key);
+		return typeof v === "string" ? v : null;
+	}
+
+	/** data.json changed through sync, for example the state folder was changed on another device. */
+	async onExternalSettingsChange() {
+		await this.loadSettings();
+		this.remotes.clear();
+		await this.loadRemotes();
+	}
+
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<TabHandoffSettings> | null);
 	}
 
 	async saveSettings() {
@@ -338,11 +379,11 @@ export default class TabHandoffPlugin extends Plugin {
 	}
 }
 
-function getScroll(view: MarkdownView): number | null {
-	const s = view.getEphemeralState().scroll;
-	if (typeof s === "number") return s;
-	const m = view.currentMode.getScroll();
-	return typeof m === "number" ? m : null;
+/** Calls back with the position once the view has loaded (PDFs take a moment), or gives up after 5 s. */
+function whenReady(reader: Reader, cb: (current: number) => void, tries = 25) {
+	const pos = reader.get();
+	if (pos != null) cb(pos);
+	else if (tries > 0) window.setTimeout(() => whenReady(reader, cb, tries - 1), 200);
 }
 
 function defaultDeviceName(): string {

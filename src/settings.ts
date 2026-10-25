@@ -83,7 +83,7 @@ export class TabHandoffSettingTab extends PluginSettingTab {
 			);
 		new Setting(containerEl)
 			.setName("Hide the state folder")
-			.setDesc("Adds it to Settings → Files and links → Excluded files, so it stays out of search, graph and the quick switcher.")
+			.setDesc("Adds it to your excluded files, so it stays out of search, the graph and the quick switcher.")
 			.addButton((b) =>
 				b.setButtonText("Hide").onClick(() => {
 					// Not in the public API, but it's the same list the "Excluded files" setting edits.
