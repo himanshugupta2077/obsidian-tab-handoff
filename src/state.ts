@@ -14,7 +14,8 @@ export interface Position {
 export interface DeviceState {
 	version: 1;
 	device: { id: string; name: string };
-	tabs: { updated: number; active: string | null; list: TabEntry[] };
+	/** `workspace` is the device's active workspace (core Workspaces plugin) when it recorded the tabs. */
+	tabs: { updated: number; active: string | null; list: TabEntry[]; workspace?: string };
 	positions: Record<string, Position>;
 }
 
@@ -58,13 +59,24 @@ export function parse(text: string): DeviceState | null {
 }
 
 /** Order-independent: a desktop with splits and a phone with one tab strip list the same tabs in different orders. */
-export function tabSignature(list: TabEntry[], active: string | null): string {
-	return JSON.stringify([active, list.map((t) => (t.pinned ? "*" : "") + t.path).sort()]);
+export function tabSignature(list: TabEntry[], active: string | null, workspace?: string): string {
+	return JSON.stringify([active, list.map((t) => (t.pinned ? "*" : "") + t.path).sort(), workspace ?? ""]);
 }
 
-export function newestTabs(remotes: Iterable<DeviceState>): DeviceState | null {
+/**
+ * Tabs from another workspace aren't handed off: they'd replace this workspace's tabs (and get saved into it).
+ * A device that recorded no workspace (none active, or an older version of this plugin) only matches another such device.
+ */
+export function sameWorkspace(a: string | undefined, b: string | undefined): boolean {
+	return (a ?? "") === (b ?? "");
+}
+
+export function newestTabs(remotes: Iterable<DeviceState>, workspace?: string): DeviceState | null {
 	let best: DeviceState | null = null;
-	for (const s of remotes) if (s.tabs.list.length && (!best || s.tabs.updated > best.tabs.updated)) best = s;
+	for (const s of remotes) {
+		if (!s.tabs.list.length || !sameWorkspace(s.tabs.workspace, workspace)) continue;
+		if (!best || s.tabs.updated > best.tabs.updated) best = s;
+	}
 	return best;
 }
 

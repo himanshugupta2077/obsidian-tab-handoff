@@ -65,6 +65,7 @@ The settings page also lists your other devices, with a button to open any devic
 
 - Only notes and files in the main area are handed off. Sidebars and the split layout stay as each device has them, and tabs from the other device open in the current tab group.
 - Files that haven't synced to this device yet are skipped.
+- With the core Workspaces plugin (or Workspaces Plus), tabs are only handed off between devices in the same workspace, so your Personal tabs never replace your Work tabs. Both devices need this version for that.
 - On a phone, Obsidian Sync uploads when the app is open. If you lock the phone the moment you stop reading, the last few seconds may only upload the next time you open Obsidian there.
 - Reading positions are tracked for Markdown notes and PDFs. Canvases and other views open as tabs, but their position isn't handed off.
 - Device clocks are used to decide which device is newer, so keep automatic time on (it is by default).

@@ -37,6 +37,21 @@ test("newest tabs and positions win; devices with no tabs are skipped", () => {
 	assert.equal(newestPosition([phone, mac], "nope.md"), null);
 });
 
+test("tabs from another workspace aren't handed off", () => {
+	const phone = emptyState("p", "Phone");
+	const mac = emptyState("m", "Mac");
+	phone.tabs = { updated: 20, active: null, list: [{ path: "home.md", pinned: false }], workspace: "Personal" };
+	mac.tabs = { updated: 10, active: null, list: [{ path: "work.md", pinned: false }], workspace: "Work" };
+	assert.equal(newestTabs([phone, mac], "Work")?.device.id, "m");
+	assert.equal(newestTabs([phone, mac], "Personal")?.device.id, "p");
+	assert.equal(newestTabs([phone], "Work"), null);
+	const old = emptyState("o", "Old");
+	old.tabs = { updated: 30, active: null, list: [{ path: "x.md", pinned: false }] };
+	assert.equal(newestTabs([phone, old], "Personal")?.device.id, "p");
+	assert.equal(newestTabs([phone, mac, old])?.device.id, "o");
+	assert.notEqual(tabSignature(phone.tabs.list, null, "Personal"), tabSignature(phone.tabs.list, null, "Work"));
+});
+
 test("prune keeps the most recent positions", () => {
 	const p = { a: { scroll: 1, ts: 1 }, b: { scroll: 1, ts: 3 }, c: { scroll: 1, ts: 2 } };
 	assert.deepEqual(Object.keys(prunePositions(p, 2)).sort(), ["b", "c"]);

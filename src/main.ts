@@ -1,5 +1,9 @@
 import { FuzzySuggestModal, Notice, Platform, Plugin, TFile, View, WorkspaceLeaf, debounce, normalizePath } from "obsidian";
 import { DeviceState, TabEntry, emptyState, newestPosition, newestTabs, parse, prunePositions, renamePath, serialize, tabSignature, timeAgo } from "./state";
+
+interface WorkspacesInternals {
+	activeWorkspace?: string;
+}
 import { Reader, readerFor } from "./readers";
 import { DEFAULT_SETTINGS, TabHandoffSettings, TabHandoffSettingTab } from "./settings";
 
@@ -72,8 +76,8 @@ export default class TabHandoffPlugin extends Plugin {
 		// Obsidian restores this device's own tabs on launch. If they match what we saved last time,
 		// keep the old timestamp so a newer handoff from another device still wins.
 		const tabs = this.currentTabs();
-		const sig = tabSignature(tabs.list, tabs.active);
-		if (sig !== tabSignature(this.local.tabs.list, this.local.tabs.active)) {
+		const sig = tabSignature(tabs.list, tabs.active, tabs.workspace);
+		if (sig !== tabSignature(this.local.tabs.list, this.local.tabs.active, this.local.tabs.workspace)) {
 			this.local.tabs = { ...tabs, updated: own ? Date.now() : 0 };
 			this.dirty = true;
 		}
@@ -119,7 +123,14 @@ export default class TabHandoffPlugin extends Plugin {
 		return out;
 	}
 
-	private currentTabs(): { list: TabEntry[]; active: string | null } {
+	/** Active workspace of the core Workspaces plugin, if it's on and one is active. */
+	private activeWorkspace(): string | undefined {
+		const plugins = (this.app as unknown as { internalPlugins?: { getEnabledPluginById?(id: string): unknown } }).internalPlugins;
+		const workspaces = plugins?.getEnabledPluginById?.("workspaces") as WorkspacesInternals | null | undefined;
+		return workspaces?.activeWorkspace || undefined;
+	}
+
+	private currentTabs(): { list: TabEntry[]; active: string | null; workspace?: string } {
 		const seen = new Set<string>();
 		const list: TabEntry[] = [];
 		for (const { path, pinned } of this.fileLeaves()) {
@@ -129,13 +140,13 @@ export default class TabHandoffPlugin extends Plugin {
 		}
 		const recent = this.app.workspace.getMostRecentLeaf(this.app.workspace.rootSplit);
 		const active = recent?.getViewState().state?.file;
-		return { list, active: typeof active === "string" ? active : null };
+		return { list, active: typeof active === "string" ? active : null, workspace: this.activeWorkspace() };
 	}
 
 	private recordTabs() {
 		if (!this.ready || this.applying || !this.settings.syncTabs) return;
 		const tabs = this.currentTabs();
-		const sig = tabSignature(tabs.list, tabs.active);
+		const sig = tabSignature(tabs.list, tabs.active, tabs.workspace);
 		if (sig === this.lastSig) return;
 		this.lastSig = sig;
 		this.local.tabs = { ...tabs, updated: Date.now() };
@@ -263,7 +274,7 @@ export default class TabHandoffPlugin extends Plugin {
 
 	private async handoff() {
 		if (this.settings.syncTabs) {
-			const src = newestTabs(this.remotes.values());
+			const src = newestTabs(this.remotes.values(), this.activeWorkspace());
 			if (src && src.tabs.updated > this.local.tabs.updated && src.tabs.updated > this.declinedTabs) {
 				if (this.settings.handoffMode === "auto") await this.applyTabs(src);
 				else this.askToApply(src);
@@ -328,7 +339,7 @@ export default class TabHandoffPlugin extends Plugin {
 			this.applying = false;
 			// Adopt the other device's timestamp, so it doesn't see our copy as "newer" and bounce it back.
 			const tabs = this.currentTabs();
-			this.lastSig = tabSignature(tabs.list, tabs.active);
+			this.lastSig = tabSignature(tabs.list, tabs.active, tabs.workspace);
 			this.local.tabs = { ...tabs, updated: src.tabs.updated };
 			this.markDirty();
 		}
@@ -443,7 +454,8 @@ class DevicePicker extends FuzzySuggestModal<DeviceState> {
 	}
 
 	getItemText(s: DeviceState) {
-		return `${s.device.name} · ${s.tabs.list.length} tabs · ${timeAgo(s.tabs.updated)}`;
+		const workspace = s.tabs.workspace ? ` · ${s.tabs.workspace}` : "";
+		return `${s.device.name}${workspace} · ${s.tabs.list.length} tabs · ${timeAgo(s.tabs.updated)}`;
 	}
 
 	onChooseItem(s: DeviceState) {
