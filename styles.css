@@ -1,0 +1,5 @@
+.tab-handoff-actions {
+	display: flex;
+	gap: var(--size-4-2);
+	margin-top: var(--size-4-2);
+}

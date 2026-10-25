@@ -1,0 +1,25 @@
+{
+	"name": "obsidian-tab-handoff",
+	"version": "1.0.0",
+	"description": "Pick up where you left off on any device: your open and pinned tabs, and the exact spot you were reading in each note.",
+	"main": "main.js",
+	"type": "module",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"test": "node --experimental-strip-types --test src/state.test.ts"
+	},
+	"keywords": ["obsidian", "plugin", "tabs", "sync", "mobile", "reading position"],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/himanshugupta2077/obsidian-tab-handoff.git"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"esbuild": "0.25.5",
+		"obsidian": "latest",
+		"tslib": "2.4.0",
+		"typescript": "^5.8.3"
+	}
+}

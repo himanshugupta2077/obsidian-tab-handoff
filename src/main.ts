@@ -1,0 +1,373 @@
+import { FuzzySuggestModal, MarkdownView, Notice, Platform, Plugin, TFile, TFolder, WorkspaceLeaf, debounce, normalizePath } from "obsidian";
+import { DeviceState, TabEntry, emptyState, newestPosition, newestTabs, parse, prunePositions, renamePath, serialize, tabSignature, timeAgo } from "./state";
+import { DEFAULT_SETTINGS, TabHandoffSettings, TabHandoffSettingTab } from "./settings";
+
+const DEVICE_ID_KEY = "tab-handoff-device-id";
+const DEVICE_NAME_KEY = "tab-handoff-device-name";
+// After the app opens or comes back to the foreground, Sync needs a few seconds to pull the other
+// device's latest file. State that arrives inside this window is still handed off.
+const RESUME_WINDOW_MS = 45_000;
+const FLUSH_INTERVAL_MS = 3_000;
+
+export default class TabHandoffPlugin extends Plugin {
+	settings: TabHandoffSettings = DEFAULT_SETTINGS;
+	deviceId = "";
+	deviceName = "";
+	local!: DeviceState;
+	remotes = new Map<string, DeviceState>();
+
+	private ready = false;
+	private dirty = false;
+	private applying = false;
+	private lastSig = "";
+	private ignoreScrollUntil = 0;
+	private resumedAt = 0;
+	private declinedTabs = 0;
+	private askNotice: Notice | null = null;
+
+	async onload() {
+		await this.loadSettings();
+		this.deviceId = this.app.loadLocalStorage(DEVICE_ID_KEY) ?? "";
+		if (!this.deviceId) {
+			this.deviceId = Math.random().toString(36).slice(2, 10);
+			this.app.saveLocalStorage(DEVICE_ID_KEY, this.deviceId);
+		}
+		this.deviceName = this.app.loadLocalStorage(DEVICE_NAME_KEY) ?? defaultDeviceName();
+		this.local = emptyState(this.deviceId, this.deviceName);
+
+		this.addSettingTab(new TabHandoffSettingTab(this.app, this));
+		this.addCommand({ id: "pick-up-tabs", name: "Pick up tabs from another device", callback: () => new DevicePicker(this).open() });
+		this.addCommand({
+			id: "jump-to-latest-position",
+			name: "Jump to the latest reading position of this note",
+			checkCallback: (checking) => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				if (!view?.file) return false;
+				if (!checking) this.catchUpPosition(view, true);
+				return true;
+			},
+		});
+		this.addCommand({ id: "save-now", name: "Save this device's tabs and position now", callback: () => this.saveNow() });
+
+		this.app.workspace.onLayoutReady(() => this.start());
+	}
+
+	onunload() {
+		void this.flush();
+	}
+
+	private async start() {
+		const own = await this.readState(this.ownPath());
+		if (own) {
+			this.local = own;
+			this.local.device.name = this.deviceName;
+		}
+		// Obsidian restores this device's own tabs on launch. If they match what we saved last time,
+		// keep the old timestamp so a newer handoff from another device still wins.
+		const tabs = this.currentTabs();
+		const sig = tabSignature(tabs.list, tabs.active);
+		if (sig !== tabSignature(this.local.tabs.list, this.local.tabs.active)) {
+			this.local.tabs = { ...tabs, updated: own ? Date.now() : 0 };
+			this.dirty = true;
+		}
+		this.lastSig = sig;
+		await this.loadRemotes();
+		this.ready = true;
+
+		const { workspace, vault } = this.app;
+		this.registerEvent(workspace.on("layout-change", () => this.recordTabs()));
+		this.registerEvent(workspace.on("active-leaf-change", () => this.recordTabs()));
+		this.registerEvent(workspace.on("file-open", (file) => file && this.onFileOpen(file)));
+		const onScroll = debounce(() => this.recordPosition(), 400, true);
+		// Scroll events don't bubble, but they can be caught on the way down.
+		this.registerDomEvent(document, "scroll", () => onScroll(), { capture: true, passive: true });
+
+		this.registerEvent(vault.on("modify", (f) => this.onVaultFile(f.path)));
+		this.registerEvent(vault.on("create", (f) => this.onVaultFile(f.path)));
+		this.registerEvent(vault.on("rename", (f, oldPath) => renamePath(this.local, oldPath, f.path) && this.markDirty()));
+
+		this.registerDomEvent(document, "visibilitychange", () => (document.hidden ? this.saveNow() : this.resume()));
+		this.registerDomEvent(window, "focus", () => this.resume());
+		this.registerDomEvent(window, "blur", () => this.saveNow());
+		this.registerInterval(window.setInterval(() => this.flush(), FLUSH_INTERVAL_MS));
+
+		await this.resume();
+	}
+
+	// ── Recording this device ─────────────────────────────────────────────
+
+	/** Main-area tabs that show a file. Uses the saved view state so tabs Obsidian hasn't loaded yet still count. */
+	private fileLeaves(): { leaf: WorkspaceLeaf; path: string; pinned: boolean }[] {
+		const out: { leaf: WorkspaceLeaf; path: string; pinned: boolean }[] = [];
+		this.app.workspace.iterateRootLeaves((leaf) => {
+			const vs = leaf.getViewState();
+			const path = vs.state?.file;
+			if (typeof path === "string") out.push({ leaf, path, pinned: !!vs.pinned });
+		});
+		return out;
+	}
+
+	private currentTabs(): { list: TabEntry[]; active: string | null } {
+		const seen = new Set<string>();
+		const list: TabEntry[] = [];
+		for (const { path, pinned } of this.fileLeaves()) {
+			if (seen.has(path)) continue;
+			seen.add(path);
+			list.push({ path, pinned });
+		}
+		const recent = this.app.workspace.getMostRecentLeaf(this.app.workspace.rootSplit);
+		const active = recent?.getViewState().state?.file;
+		return { list, active: typeof active === "string" ? active : null };
+	}
+
+	private recordTabs() {
+		if (!this.ready || this.applying || !this.settings.syncTabs) return;
+		const tabs = this.currentTabs();
+		const sig = tabSignature(tabs.list, tabs.active);
+		if (sig === this.lastSig) return;
+		this.lastSig = sig;
+		this.local.tabs = { ...tabs, updated: Date.now() };
+		this.markDirty();
+	}
+
+	private recordPosition() {
+		if (!this.ready || !this.settings.syncPositions || Date.now() < this.ignoreScrollUntil) return;
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const scroll = view && getScroll(view);
+		if (!view?.file || scroll == null) return;
+		const prev = this.local.positions[view.file.path];
+		if (prev && Math.abs(prev.scroll - scroll) < 0.5) return;
+		this.local.positions[view.file.path] = { scroll, ts: Date.now() };
+		this.markDirty();
+	}
+
+	private markDirty() {
+		this.dirty = true;
+	}
+
+	private saveNow() {
+		this.recordTabs();
+		this.recordPosition();
+		void this.flush();
+	}
+
+	async flush() {
+		if (!this.dirty || !this.ready) return;
+		this.dirty = false;
+		this.local.device.name = this.deviceName;
+		this.local.positions = prunePositions(this.local.positions, this.settings.maxPositions);
+		try {
+			const folder = this.folder();
+			if (!(await this.app.vault.adapter.exists(folder))) await this.app.vault.createFolder(folder);
+			await this.app.vault.adapter.write(this.ownPath(), serialize(this.local));
+		} catch (e) {
+			this.dirty = true;
+			console.error("Tab Handoff: could not save device state", e);
+		}
+	}
+
+	// ── Reading other devices ─────────────────────────────────────────────
+
+	folder() {
+		return normalizePath(this.settings.folder || DEFAULT_SETTINGS.folder);
+	}
+
+	private ownPath() {
+		return normalizePath(`${this.folder()}/${this.deviceId}.md`);
+	}
+
+	private async readState(path: string): Promise<DeviceState | null> {
+		try {
+			if (!(await this.app.vault.adapter.exists(path))) return null;
+			return parse(await this.app.vault.adapter.read(path));
+		} catch {
+			return null;
+		}
+	}
+
+	async loadRemotes() {
+		const folder = this.app.vault.getAbstractFileByPath(this.folder());
+		if (!(folder instanceof TFolder)) return;
+		for (const f of folder.children) if (f instanceof TFile) await this.loadRemote(f.path);
+	}
+
+	private async loadRemote(path: string) {
+		if (path === this.ownPath() || !path.endsWith(".md")) return;
+		const s = await this.readState(path);
+		if (s && s.device.id !== this.deviceId) this.remotes.set(s.device.id, s);
+	}
+
+	private async onVaultFile(path: string) {
+		if (!path.startsWith(this.folder() + "/") || path === this.ownPath()) return;
+		await this.loadRemote(path);
+		// Sync delivered another device's state. Hand it off only if this device just woke up;
+		// otherwise you're working here and shouldn't be yanked around.
+		if (Date.now() - this.resumedAt < RESUME_WINDOW_MS) await this.handoff();
+	}
+
+	// ── Handing off ───────────────────────────────────────────────────────
+
+	private async resume() {
+		if (!this.ready || Date.now() - this.resumedAt < 1500) return;
+		this.resumedAt = Date.now();
+		await this.loadRemotes();
+		await this.handoff();
+	}
+
+	private async handoff() {
+		if (this.settings.syncTabs) {
+			const src = newestTabs(this.remotes.values());
+			if (src && src.tabs.updated > this.local.tabs.updated && src.tabs.updated > this.declinedTabs) {
+				if (this.settings.handoffMode === "auto") await this.applyTabs(src);
+				else this.askToApply(src);
+				return;
+			}
+		}
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (view) this.catchUpPosition(view, false);
+	}
+
+	private askToApply(src: DeviceState) {
+		this.askNotice?.hide();
+		const frag = createFragment((f) => {
+			f.createDiv({ text: `${src.device.name} has ${src.tabs.list.length} open tabs (${timeAgo(src.tabs.updated)}).` });
+			const row = f.createDiv({ cls: "tab-handoff-actions" });
+			row.createEl("button", { text: "Open them", cls: "mod-cta" }).onclick = () => {
+				this.askNotice?.hide();
+				void this.applyTabs(src);
+			};
+			row.createEl("button", { text: "Not now" }).onclick = () => this.askNotice?.hide();
+		});
+		this.declinedTabs = src.tabs.updated;
+		this.askNotice = new Notice(frag, 0);
+	}
+
+	async applyTabs(src: DeviceState) {
+		const { workspace, vault } = this.app;
+		this.applying = true;
+		try {
+			const wanted = src.tabs.list.filter((t) => vault.getAbstractFileByPath(t.path) instanceof TFile);
+			const wantedPaths = new Set(wanted.map((t) => t.path));
+			const open = new Map<string, WorkspaceLeaf>();
+			for (const { leaf, path } of this.fileLeaves()) if (!open.has(path)) open.set(path, leaf);
+
+			for (const t of wanted) {
+				let leaf = open.get(t.path);
+				if (!leaf) {
+					leaf = workspace.getLeaf("tab");
+					await leaf.openFile(vault.getAbstractFileByPath(t.path) as TFile, { active: false });
+					open.set(t.path, leaf);
+				}
+				if (!!leaf.getViewState().pinned !== t.pinned) leaf.setPinned(t.pinned);
+			}
+			// Mirror: close what the other device closed. Pinned tabs on this device are never closed.
+			if (this.settings.mirror) {
+				for (const { leaf, path, pinned } of this.fileLeaves()) if (!wantedPaths.has(path) && !pinned) leaf.detach();
+			}
+
+			const activeLeaf = src.tabs.active ? open.get(src.tabs.active) : undefined;
+			if (activeLeaf) {
+				workspace.setActiveLeaf(activeLeaf, { focus: !Platform.isMobile });
+				await activeLeaf.loadIfDeferred();
+				if (activeLeaf.view instanceof MarkdownView) this.catchUpPosition(activeLeaf.view, false);
+			}
+			if (this.settings.notify) new Notice(`Picked up ${wanted.length} tabs from ${src.device.name}`, 3000);
+		} finally {
+			this.applying = false;
+			// Adopt the other device's timestamp, so it doesn't see our copy as "newer" and bounce it back.
+			const tabs = this.currentTabs();
+			this.lastSig = tabSignature(tabs.list, tabs.active);
+			this.local.tabs = { ...tabs, updated: src.tabs.updated };
+			this.markDirty();
+		}
+	}
+
+	/** Moves the note to the newest position recorded on another device, if that's newer than this device's own. */
+	catchUpPosition(view: MarkdownView, force: boolean) {
+		if (!this.settings.syncPositions || !view.file) return;
+		const path = view.file.path;
+		const best = newestPosition([this.local, ...this.remotes.values()], path);
+		if (!best || (best.from === this.local && !force)) return;
+		const current = getScroll(view) ?? 0;
+		if (Math.abs(current - best.scroll) < 1) return;
+		this.scrollTo(view, best.scroll, best.ts);
+		if (this.settings.notify && best.from !== this.local) new Notice(`Resumed where you left off on ${best.from.device.name}`, 2500);
+	}
+
+	/** A note was opened. If it opened at the top, put it back where it was last read on any device. */
+	private onFileOpen(file: TFile) {
+		if (!this.settings.restoreOnOpen || !this.settings.syncPositions || this.applying) return;
+		window.setTimeout(() => {
+			const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+			if (view?.file !== file) return;
+			// Already scrolled: a link to a heading, back/forward history, or a tab that kept its place.
+			if ((getScroll(view) ?? 0) > 1) return;
+			const best = newestPosition([this.local, ...this.remotes.values()], file.path);
+			if (best && best.scroll > 1) this.scrollTo(view, best.scroll, best.ts);
+		}, 60);
+	}
+
+	private scrollTo(view: MarkdownView, scroll: number, ts: number) {
+		const path = view.file?.path;
+		if (!path) return;
+		this.ignoreScrollUntil = Date.now() + 1500;
+		const apply = () => view.file?.path === path && view.setEphemeralState({ scroll });
+		apply();
+		// Reading view renders lazily; apply again once it has laid out.
+		window.setTimeout(apply, 150);
+		window.setTimeout(apply, 500);
+		// Same reasoning as tabs: keep the source timestamp so the position doesn't ping-pong.
+		this.local.positions[path] = { scroll, ts };
+		this.markDirty();
+	}
+
+	// ── Settings ──────────────────────────────────────────────────────────
+
+	setDeviceName(name: string) {
+		this.deviceName = name.trim() || defaultDeviceName();
+		this.app.saveLocalStorage(DEVICE_NAME_KEY, this.deviceName);
+		this.markDirty();
+	}
+
+	async loadSettings() {
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	}
+
+	async saveSettings() {
+		await this.saveData(this.settings);
+	}
+}
+
+function getScroll(view: MarkdownView): number | null {
+	const s = view.getEphemeralState().scroll;
+	if (typeof s === "number") return s;
+	const m = view.currentMode.getScroll();
+	return typeof m === "number" ? m : null;
+}
+
+function defaultDeviceName(): string {
+	if (Platform.isIosApp) return Platform.isTablet ? "iPad" : "iPhone";
+	if (Platform.isAndroidApp) return Platform.isTablet ? "Android tablet" : "Android phone";
+	if (Platform.isMacOS) return "Mac";
+	if (Platform.isWin) return "Windows PC";
+	return "Linux PC";
+}
+
+class DevicePicker extends FuzzySuggestModal<DeviceState> {
+	constructor(private plugin: TabHandoffPlugin) {
+		super(plugin.app);
+		this.setPlaceholder("Pick up tabs from…");
+	}
+
+	getItems() {
+		return [...this.plugin.remotes.values()].filter((s) => s.tabs.list.length).sort((a, b) => b.tabs.updated - a.tabs.updated);
+	}
+
+	getItemText(s: DeviceState) {
+		return `${s.device.name} · ${s.tabs.list.length} tabs · ${timeAgo(s.tabs.updated)}`;
+	}
+
+	onChooseItem(s: DeviceState) {
+		void this.plugin.applyTabs(s);
+	}
+}
